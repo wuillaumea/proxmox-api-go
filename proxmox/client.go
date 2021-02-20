@@ -20,6 +20,9 @@ import (
 	"time"
 )
 
+// TaskTimeout - default async task call timeout in seconds
+const TaskTimeout = 300
+
 // TaskStatusCheckInterval - time between async checks in seconds
 const TaskStatusCheckInterval = 2
 
@@ -27,12 +30,11 @@ const exitStatusSuccess = "OK"
 
 // Client - URL, user and password to specifc Proxmox node
 type Client struct {
-	session     *Session
-	ApiUrl      string
-	Username    string
-	Password    string
-	Otp         string
-	TaskTimeout int
+	session  *Session
+	ApiUrl   string
+	Username string
+	Password string
+	Otp      string
 }
 
 // VmRef - virtual machine ref parts
@@ -84,11 +86,11 @@ func NewVmRef(vmId int) (vmr *VmRef) {
 	return
 }
 
-func NewClient(apiUrl string, hclient *http.Client, tls *tls.Config, taskTimeout int) (client *Client, err error) {
+func NewClient(apiUrl string, hclient *http.Client, tls *tls.Config) (client *Client, err error) {
 	var sess *Session
 	sess, err = NewSession(apiUrl, hclient, tls)
 	if err == nil {
-		client = &Client{session: sess, ApiUrl: apiUrl, TaskTimeout: taskTimeout}
+		client = &Client{session: sess, ApiUrl: apiUrl}
 	}
 	return client, err
 }
@@ -209,40 +211,6 @@ func (c *Client) GetVmConfig(vmr *VmRef) (vmConfig map[string]interface{}, err e
 		return nil, errors.New("Vm CONFIG not readable")
 	}
 	vmConfig = data["data"].(map[string]interface{})
-	return
-}
-
-func (c *Client) GetStorageStatus(vmr *VmRef, storageName string) (storageStatus map[string]interface{}, err error) {
-	err = c.CheckVmRef(vmr)
-	if err != nil {
-		return nil, err
-	}
-	var data map[string]interface{}
-	url := fmt.Sprintf("/nodes/%s/storage/%s/status", vmr.node, storageName)
-	err = c.GetJsonRetryable(url, &data, 3)
-	if err != nil {
-		return nil, err
-	}
-	if data["data"] == nil {
-		return nil, errors.New("Storage STATUS not readable")
-	}
-	storageStatus = data["data"].(map[string]interface{})
-	return
-}
-
-func (c *Client) GetStorageContent(vmr *VmRef, storageName string) (data map[string]interface{}, err error) {
-	err = c.CheckVmRef(vmr)
-	if err != nil {
-		return nil, err
-	}
-	url := fmt.Sprintf("/nodes/%s/storage/%s/content", vmr.node, storageName)
-	err = c.GetJsonRetryable(url, &data, 3)
-	if err != nil {
-		return nil, err
-	}
-	if data["data"] == nil {
-		return nil, errors.New("Storage Content not readable")
-	}
 	return
 }
 
@@ -375,7 +343,7 @@ func (c *Client) WaitForCompletion(taskResponse map[string]interface{}) (waitExi
 	}
 	waited := 0
 	taskUpid := taskResponse["data"].(string)
-	for waited < c.TaskTimeout {
+	for waited < TaskTimeout {
 		exitStatus, statErr := c.GetTaskExitstatus(taskUpid)
 		if statErr != nil {
 			if statErr != io.ErrUnexpectedEOF { // don't give up on ErrUnexpectedEOF
@@ -555,61 +523,6 @@ func (c *Client) CloneQemuVm(vmr *VmRef, vmParams map[string]interface{}) (exitS
 	return
 }
 
-func (c *Client) CreateQemuSnapshot(vmr *VmRef, snapshotName string) (exitStatus string, err error) {
-	err = c.CheckVmRef(vmr)
-	snapshotParams := map[string]interface{}{
-		"snapname": snapshotName,
-	}
-	reqbody := ParamsToBody(snapshotParams)
-	if err != nil {
-		return "", err
-	}
-	url := fmt.Sprintf("/nodes/%s/%s/%d/snapshot/", vmr.node, vmr.vmType, vmr.vmId)
-	resp, err := c.session.Post(url, nil, nil, &reqbody)
-	if err == nil {
-		taskResponse, err := ResponseJSON(resp)
-		if err != nil {
-			return "", err
-		}
-		exitStatus, err = c.WaitForCompletion(taskResponse)
-	}
-	return
-}
-
-func (c *Client) DeleteQemuSnapshot(vmr *VmRef, snapshotName string) (exitStatus string, err error) {
-	err = c.CheckVmRef(vmr)
-	if err != nil {
-		return "", err
-	}
-	url := fmt.Sprintf("/nodes/%s/%s/%d/snapshot/%s", vmr.node, vmr.vmType, vmr.vmId, snapshotName)
-	resp, err := c.session.Delete(url, nil, nil)
-	if err == nil {
-		taskResponse, err := ResponseJSON(resp)
-		if err != nil {
-			return "", err
-		}
-		exitStatus, err = c.WaitForCompletion(taskResponse)
-	}
-	return
-}
-
-func (c *Client) ListQemuSnapshot(vmr *VmRef) (taskResponse map[string]interface{}, exitStatus string, err error) {
-	err = c.CheckVmRef(vmr)
-	if err != nil {
-		return nil, "", err
-	}
-	url := fmt.Sprintf("/nodes/%s/%s/%d/snapshot/", vmr.node, vmr.vmType, vmr.vmId)
-	resp, err := c.session.Get(url, nil, nil)
-	if err == nil {
-		taskResponse, err := ResponseJSON(resp)
-		if err != nil {
-			return nil, "", err
-		}
-		return taskResponse, "", nil
-	}
-	return
-}
-
 func (c *Client) RollbackQemuVm(vmr *VmRef, snapshot string) (exitStatus string, err error) {
 	err = c.CheckVmRef(vmr)
 	if err != nil {
@@ -668,41 +581,17 @@ func (c *Client) MigrateNode(vmr *VmRef, newTargetNode string, online bool) (exi
 	return nil, err
 }
 
-// ResizeQemuDisk allows the caller to increase the size of a disk by the indicated number of gigabytes
 func (c *Client) ResizeQemuDisk(vmr *VmRef, disk string, moreSizeGB int) (exitStatus interface{}, err error) {
-	size := fmt.Sprintf("+%dG", moreSizeGB)
-	return c.ResizeQemuDiskRaw(vmr, disk, size)
-}
-
-// ResizeQemuDiskRaw allows the caller to provide the raw resize string to be send to proxmox.
-// See the proxmox API documentation for full information, but the short version is if you prefix
-// your desired size with a '+' character it will ADD size to the disk.  If you just specify the size by
-// itself it will do an absolute resizing to the specified size. Permitted suffixes are K, M, G, T
-// to indicate order of magnitude (kilobyte, megabyte, etc). Decrease of disk size is not permitted.
-func (c *Client) ResizeQemuDiskRaw(vmr *VmRef, disk string, size string) (exitStatus interface{}, err error) {
 	// PUT
 	//disk:virtio0
 	//size:+2G
 	if disk == "" {
 		disk = "virtio0"
 	}
+	size := fmt.Sprintf("+%dG", moreSizeGB)
 	reqbody := ParamsToBody(map[string]interface{}{"disk": disk, "size": size})
 	url := fmt.Sprintf("/nodes/%s/%s/%d/resize", vmr.node, vmr.vmType, vmr.vmId)
 	resp, err := c.session.Put(url, nil, nil, &reqbody)
-	if err == nil {
-		taskResponse, err := ResponseJSON(resp)
-		if err != nil {
-			return nil, err
-		}
-		exitStatus, err = c.WaitForCompletion(taskResponse)
-	}
-	return
-}
-
-func (c *Client) MoveLxcDisk(vmr *VmRef, disk string, storage string) (exitStatus interface{}, err error) {
-	reqbody := ParamsToBody(map[string]interface{}{"disk": disk, "storage": storage, "delete": true})
-	url := fmt.Sprintf("/nodes/%s/%s/%d/move_volume", vmr.node, vmr.vmType, vmr.vmId)
-	resp, err := c.session.Post(url, nil, nil, &reqbody)
 	if err == nil {
 		taskResponse, err := ResponseJSON(resp)
 		if err != nil {
@@ -772,7 +661,7 @@ func (c *Client) CreateVMDisk(
 			return err
 		}
 		if diskName, containsData := taskResponse["data"]; !containsData || diskName != fullDiskName {
-			return errors.New(fmt.Sprintf("Cannot create VM disk %s - %s", fullDiskName, diskName))
+			return errors.New(fmt.Sprintf("Cannot create VM disk %s", fullDiskName))
 		}
 	} else {
 		return err
@@ -791,7 +680,7 @@ func (c *Client) createVMDisks(
 	for deviceName, deviceConf := range vmParams {
 		rxStorageModels := `(ide|sata|scsi|virtio)\d+`
 		if matched, _ := regexp.MatchString(rxStorageModels, deviceName); matched {
-			deviceConfMap := ParsePMConf(deviceConf.(string), "")
+			deviceConfMap := ParseConf(deviceConf.(string), ",", "=")
 			// This if condition to differentiate between `disk` and `cdrom`.
 			if media, containsFile := deviceConfMap["media"]; containsFile && media == "disk" {
 				fullDiskName := deviceConfMap["file"].(string)
